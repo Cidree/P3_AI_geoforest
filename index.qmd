@@ -1,0 +1,906 @@
+---
+title: "Práctica 3 - Algoritmos de Inteligencia Artificial para ciencias forestales"
+author: "Adrián Cidre González"
+date:  "04/01/2023"
+date-format: long
+
+# Format options
+lang: es
+page-layout: full
+format: 
+  html:
+    toc: true
+    toc-location: left
+    toc-title: 'Contenidos'
+    css: './styles/style.css'
+    theme: united
+    highlight-style: dracula
+  
+# Code
+code-copy: hover
+#code-fold: true
+execute: 
+  warning: false
+
+# References
+bibliography: './styles/biblio.bib'
+crossref: 
+  fig-title: Fig.
+
+# Figures and tables
+fig-align: 'center'
+fig-width: 14
+fig-height: 8
+fig-cap-location: bottom
+tbl-cap-location: top
+
+---
+
+![](styles/ml.jpg){fig-align="center"}
+
+```{r}
+#| echo: false
+knitr::opts_chunk$set(ft.align = 'center')
+```
+
+
+
+# Introducción  
+
+En esta práctica se tomará contacto con los métodos supervisados de *machine learning*, aplicando los principios generales vistos durante la asignatura de Algoritmos de Inteligencia Artificial para las Ciencias Forestales dentro del Máster Geoforest.  
+
+Para llevar a cabo esta tarea, se utiliza la versión 4.2.2 del software R [@R]. Todos los pasos del proceso de modelado se han llevado a cabo utilizando el universo de paquetes incluido en *tidymodels* [@tidymodels]. Todos los paquetes utilizados se encuentran en el siguiente bloque de código:  
+
+```{r}
+#| code-summary: 'Paquetes'
+require(pacman)
+
+p_load(here, terra, tidymodels, sf, mapview, vip, skimr, flextable, cptcity, readr,  tidyterra, report, finetune)
+```
+
+
+
+<br>
+
+# Resolución del ejercicio  
+
+## Prepraración de los datos   
+
+En primer lugar, se cargan los datos correspondientes a la variable dependiente. Consiste en un *shapefile* de polígonos con 407 observaciones sobre la clase de uso de suelo dentro del Parque Nacional Sierra de las Nieves [Fig. @fig-rois].  
+
+```{r readData}
+#| code-summary: Codigo carga de rois
+rois <- read_sf(here('01-datos/ROIS.shp'))
+
+st_geometry(rois)           # <- visualizar geometria
+head(st_drop_geometry(rois))# <- visualizar encabezado atributos
+```
+
+```{r}
+#| echo: false
+#| fig-cap: 'Localización de las áreas de entrenamiento'
+#| label: fig-rois
+mapview(rois,
+        zcol = 'Class_Name',
+        layer.name = 'Clases')
+```
+
+<br>
+
+En siguiente lugar, se cargan los datos que contienen las firmas espectrales, correspondientes a las variables predictoras. Dichas variables se listan a continuación:  
+
+
+```{r readTraining}
+#| code-summary: 'Código carga de datos'
+training <- read.csv(here('01-datos/training.csv')) |> 
+  dplyr::select(-X)
+
+ls(training)
+```
+
+Para trabajar con *tidymodels* es mejor tener variables predictoras y variable respuesta en un mismo objeto. En el siguiente código se unen, y muestra una descripción de las variables:  
+
+
+```{r}
+# Unir variable dependiente a los datos
+myData <- training |> 
+  cbind(class_id = factor(rois$Class_Id))
+
+# Descripción de las variables
+skim(myData)
+```
+
+Vemos que contamos con nuestra variable predictora como un factor con $8$ niveles, y un total de 31 variables predictores todas numéricas y en distintas escalas, lo que puede condicionar a algunos algoritmos.  
+
+Guardamos el objecto para utilizarlo posteriormente en la práctica 4.  
+
+```{r}
+write.csv(myData, here('02-results/myData.csv'))
+```
+
+
+## Modelo Random Forest  
+
+En primer lugar se utilizará el algoritmo *Random Forest*, el cuál combina árboles de decisión con *n* observaciones y *k* variables en distintas combinaciones para cada árbol de forma que se obtiene un estimador más robusto [@Breiman2001]. Este primer modelo se realizará paso a paso explicando lo que realiza cada función. La web oficial de *tidymodels* se puede visitar  [aquí](https://www.tidymodels.org/).  
+
+### Data split   
+
+*Tidymodels* trabaja de forma que en primer lugar se realiza una separación de los datos en *training* y *testing*, de forma que los hiperparámetros y el modelo se entrenarán solamente en el primer *set* de datos, mientras que los datos *testing* solamente se utilizarán al final de todo el proceso para evitar que se produzca *data leakage*, es decir, para que los datos de prueba no tengan ninguna influencia en el proceso de entrenamiento [@silge2022]. Por ello, vamos a dejar un $20$% de la muestra para validación del modelo.  
+
+Además, como es un proceso aleatorio, se establece una semilla para que el proceso sea replicable.  
+
+
+```{r initialSplit}
+set.seed(126)
+initial <- initial_split(myData,
+                         prop = 0.80,
+                         strata = class_id)
+myTraining <- training(initial)
+myTesting <- testing(initial)
+
+print(initial)
+```
+
+Entrenaremos el modelo con 324 observaciones, y se validará con 83 observaciones.  
+
+:::{.callout-tip}
+Con el argumento `strata` nos aseguramos de que las clases de uso del suelo se repartan proporcionalmente en ambos *sets*.    
+:::
+
+<br>  
+
+### Crear modelo y workflow  
+
+Existen varias formas de crear modelos en *tidymodels*, pero la más directa y conveniente es utilizando *workflows* [@silge2022]. Estos pueden albergan diferentes objetos como son un modelo, formula, receta o variables.  
+
+En este ejercicio se crea una especificación del modelo *Random Forest* en el cual indicamos los hiperparámetros que queremos tunear (en este caso el número de árboles y de variables explicativas en cada árbol). Además, se debe elegir el modo (clasficación o regresión) y el motor (paquete fuente del modelo).  
+
+La *recipe* es un objeto que consiste en una fórmula y un número determinado de funciones `step_*` que se engloban dentro de *feature engineering*. En este caso solamente vamos a utilizar `step_zv()` que elimina variables que solamente contienen un único valor (*zv* de *zero variance*).  
+
+```{r workflow}
+# Especificacion del modelo
+rf_spec <- rand_forest(
+  mtry = tune(),
+  trees = tune()
+) |> 
+  set_mode('classification') |> 
+  set_engine('randomForest')
+
+# Receta del modelo
+rec_simple <- recipe(class_id ~ ., data = myTraining) |> 
+  step_zv(all_predictors()) 
+
+# Crear workflow
+rf_wflow <- workflow() |> 
+  add_model(rf_spec) |> 
+  add_recipe(rec_simple) 
+
+# Imprimir contenido del workflow
+print(rf_wflow)
+```
+
+<br>
+
+Vemos que el *workflow* tiene un preprocesador (la receta) y un modelo *Random Forest* cuyos argumentos *mtry* y *trees* se tunearán.  
+
+### Tunear hiperparámetros  
+
+En sentido amplio, existen tres métodos para elegir hiperparámetros: *grid search*, *iterative search* y métodos híbridos. Existen varios métodos dentro de cada uno, pero para este ejercicio se ha pedido utilizar un *regular grid* con cuatro valores de *mtry* (3, 4, 5, 6) y tres valores de *trees* (1000, 5000, 10000). Para tunear un modelo con *regular grid* podemos utilizar la función `tune_grid()`, cuyos argumentos son los siguientes:  
+
+* **object**: en este caso, el *workflow*  
+
+* **resamples**: objecto que indica la realización de *resampling*. En este caso se utiliza *10-fold Cross-Validation* (`vfold_cv()`).  
+
+* **metrics**: para clasificación utiliza por defecto *accuracy* y *roc_auc*. Se pueden introducir otras mediante un objeto creado con la función `metric_set()`. Las métricas disponibles se pueden consultar [aquí](https://yardstick.tidymodels.org/articles/metric-types.html).    
+
+* **grid**: en este caso la *regular grid*, creada con la función `crossing()`.  
+
+* **control**: parámetros de control para modificar el tuneado.  
+
+```{r resamples_Grilla}
+# 10-fold Cross Validation
+set.seed(126)
+myFolds <- vfold_cv(myTraining, v = 10)
+
+# Regular grid
+myGrid <- crossing(mtry = c(3:6),
+                   trees = c(1000, 5000, 10000))
+
+# Parametros de control
+control <- control_grid(save_pred = TRUE)
+
+# Metricas
+metrics <- metric_set(kap, mn_log_loss, roc_auc, accuracy)
+
+# Imprimir la grilla en pantalla
+print(myGrid)
+```
+
+Con todos los argumentos especificados, podemos tunear el modelo (utilizando *parallel processing* tarda 1-2 minutos).  
+
+```{r rfTune}
+#| cache: true
+# Tuning RF
+doParallel::registerDoParallel()
+rf_tune <- tune_grid(
+  rf_wflow,
+  resamples = myFolds,
+  metrics = metrics,
+  grid = myGrid
+)
+```
+
+
+### Resultados tuning  
+
+En la [Fig. @fig-rfhiper] vemos el desempeño medio de los modelos para los distintos valores de los hiperparámetros. La *accuracy* o exactitud global tiene su mejor desempeño para 4 *k* variables y 1000 árboles. Para el índice Kappa, los valores más altos se alcanzan con los mismos valores. En el caso de *mean log loss*, cambia ligeramente, aunque apenas existe variación entre modelos. Finalmente, los valores de ROC AUC son prácticamente todos iguales a 0.98.  
+
+```{r plotTuneRF}
+#| fig-cap: Desempeño de las métricas de clasificación para diferentes valores de los hiperparámetros
+#| echo: false
+#| label: fig-rfhiper
+rf_tune |> 
+  collect_metrics() |> 
+  ggplot(aes(mtry, mean, color = factor(trees))) +
+  geom_line(alpha = 0.5, size = 1.5) +
+  geom_point() +
+  labs(y = "") +
+  facet_wrap(~.metric,
+             labeller = labeller(.metric = c(kap = "Kappa", 
+                                             mn_log_loss = "Mean log loss",
+                                             roc_auc = "ROC AUC",
+                                             accuracy = "Accuracy")),
+             scales = 'free') + 
+  scale_y_continuous(
+  labels = scales::number_format(accuracy = 0.001,
+                                 decimal.mark = '.')) +
+  scale_color_discrete(name = 'Trees') +
+  theme_bw() + 
+  theme(legend.position = 'top') +
+  theme(text = element_text(size = 12))
+```
+
+### Seleccionar el mejor modelo  
+
+Existen varias formas de seleccionar el mejor modelo. En este caso como las métricas son muy similares entre modelos, vamos a seleccionar el más parsimonioso utilizando la función `select_by_one_std_err()`. Lo que hace esta función es utilizar la regla de una desviación de error [@Breiman2017] de forma que, a partir de los modelos situados a una desviación estándar del óptimo, escoge el más simple.  
+
+```{r}
+# Seleccionar mejor modelo basado en mean log loss
+best_mll <- rf_tune |> 
+  select_by_one_std_err('kap')
+
+# Imprimir objeto
+print(best_mll)
+```
+
+De esta forma obtenemos como mejor modelo el que tiene 1000 árboles y 3 variables por árbol, con una media de índice Kappa de 0.792.  
+
+El siguiente paso consiste en finalizar el *workflow*. Esto quiere decir que al *workflow* inicial le indicamos los valores de los hiperparámetros que hemos escogido:  
+
+```{r}
+# Finalizar workflow
+rf_final <- finalize_workflow(
+  rf_wflow,
+  best_mll
+)
+
+# Imprimir workflow final
+print(rf_final)
+```
+
+<br>
+
+Vemos que ahora los argumentos principales tienen los valores que le hemos indicado.  
+
+### Importancia de las variables   
+
+La importancia de las variables indica la pérdida de precisión al eliminar una variable, de forma que las variables con mayor valor tienen una mayor importancia en el modelo. en la [Fig. @fig-viprf] se muestran las 10 variables más importantes.  
+
+```{r}
+#| echo: false
+#| fig-cap: 'Importancia de las variables utilizadas con Random Forest'
+#| label: fig-viprf
+rf_final |> 
+  extract_spec_parsnip() |> 
+  set_engine("randomForest") |> 
+  fit(class_id ~ .,
+      data = juice(prep(rec_simple)) 
+  ) |> 
+  vip(geom = "point", size = 2) +
+  geom_point(size = 3) +
+  theme_bw() +
+  theme(text = element_text(size = 12))
+```
+
+### Last fit  
+
+El *last fit* consiste en el último ajuste del modelo, en el que nos aseguramos que en las predicciones no existe *data leakage* dado que los datos no se han utilizado en ningún momento durante el proceso de creación del modelo [@silge2022]. Para ello, utilizamos la función `last_fit()` y `collect_metrics()` para ver los resultados. La primera función utiliza los datos de entrenamiento del principio para ajustar el modelo, y evalúa el rendimiento en los datos de prueba.    
+
+```{r}
+final_res <- rf_final |> 
+  last_fit(initial,
+           metrics = metrics)
+
+final_res |> 
+  collect_metrics()
+```
+
+
+Vemos que los valores obtenidos para todas las métricas son similares a los alcanzados por los datos de entrenamiento, por lo que el modelo no está sobreajustado. La matriz de confusión se muestra en la [Fig. @fig-cmrf].  
+
+```{r}
+#| fig-cap: 'Matriz de confusión del modelo Random Forest'
+#| label: fig-cmrf
+final_res |> 
+  collect_predictions() |> 
+  conf_mat(class_id, .pred_class) |> 
+  autoplot(type = 'heatmap')
+```
+<br>
+
+### Guardar el modelo  
+
+Algo importante es guardar nuestro modelo para poder utilizarlo en otros datos. Para ello debemos extraer el objeto del modelo utilizando `extract_fit_parsnip` en el objeto final ajustado a los datos.
+
+```{r}
+rf_model <- extract_fit_parsnip(final_res)
+
+write_rds(rf_model,
+          here('02-results/rf_model.rds'))
+```
+
+
+### Cuestiones  
+
+**Cuáles son las clases mejor y peor clasificadas?**  
+
+Para saber a qué clase pertenece cada código podemos utilizar el siguiente código:  
+
+```{r}
+rois |> 
+  distinct(Class_Id, Class_Name) 
+```
+
+De esta forma podemos ver en la matriz de confusión que los errores por omisión se corresponden a:  
+
+ - Suelo: dos píxeles clasificados como urbano, dos píxeles clasificados como matorral y un píxel clasificado como pastizal.  
+ 
+ - Matorral: tres píxeles clasificados como pastizal, un píxel clasificado como suelo.  
+ 
+ En cuando a los errores por comisión:  
+ 
+ - Pastizal: tres píxeles clasificados como matorral y un píxel clasificado como suelos.  
+ 
+Y las clases mejor clasificadas han sido: caducifolio y secano.  
+
+* **Qué clases se confunden entre sí?**  
+
+Pastizal (3) con suelos (7)  
+
+Coníferas (4) con quercíneas (5)  
+
+Suelos (7) con matorral (8)  
+
+* **Cuáles son las variables más importantes en el modelo general?**  
+
+Si volvemos a la [Fig. @fig-viprf] vemos que las 5 variables más importantes son:  
+
+<center>
+```{r}
+#| echo: false
+x <- data.frame(
+  Ranking = 1:5,
+  Variable = c('RedP','SWIR2P','BlueP','RedEdge1P','RedV')
+)
+
+flextable(x)
+```
+</center>
+
+<br> 
+
+Por lo que en general, las variables primaverales son las más importantes.  
+
+* **Cuáles son las más importantes para cada categoría?**  
+
+Para obtener estos valores debemos extraer el modelo del workflow (`extract_spec_parsnip()`), y cambiar el motor indicando que queremos `localImp = TRUE`. De esta forma podemos ver el mapa de calor que se presenta en la [Fig. @fig-heat]. También se puede identificar variables cercanas gracias al dendrograma.  
+
+
+```{r}
+#| fig-cap: 'Dendrograma y mapa de calor de la importancia de las variables por clase. Los valores más oscuros representan mayor importancia.'
+#| label: fig-heat
+#| fig-height: 15
+# Ajuste modelo
+set.seed(126)
+rf_fit <- rf_final |> 
+  extract_spec_parsnip() |> 
+  set_engine("randomForest",localImp = TRUE) |> 
+  fit(class_id ~ .,
+      data = juice(prep(rec_simple))
+  ) 
+
+rf_fit$fit$importance[,-c(9,10)] |> 
+  heatmap(col = cpt('jjg_cbac_seq_cbacGreys05'))
+```
+
+* **Existen diferencias entre la importancia derivada de "mean decrease in accuracy" y "mean decrease in Gini"?**  
+
+Estas medidas pueden verse dentro del objeto anterior (se corresponde a las columnas 9 y 10 eliminadas en el mapa de calor):  
+
+<center>
+```{r}
+#| echo: false
+rf_fit$fit$importance[,c(9, 10)] |> 
+  as.data.frame() |> 
+  flextable()
+```
+</center>
+
+Podemos crear una tabla donde se ordeden de mayor a menor la importancia de cada variable para cada una de las medidas. Podemos ver en la siguiente que tabla que difieren bastante, aunque las bandas que para *mean decrease in accuracy* son las más relevantes, también lo son para *mean decrease in Gini* aunque cambiando alguna banda de orden.  
+
+```{r}
+mda <- rf_fit$fit$importance[,c(9)] |> sort(decreasing = T) |> names()
+mdg <- rf_fit$fit$importance[,c(10)] |> sort(decreasing = T) |> names()
+
+md_tbl <- data.frame(
+  Ranking = 1:30,
+  MDA = mda,
+  MDG = mdg
+) 
+```
+
+<center>
+```{r}
+#| echo: false
+flextable(md_tbl)
+```
+</center>
+
+<br>
+
+* **Qué tipo de selección de características crees que es la que lleva a cabo Random Forest?**  
+
+El algoritmo *Random Forest* utiliza una combinación de árboles de decisión y una técnica llamada *bootstrap aggregation* (*bagging*) que aumenta la diversidad de los árboles. Para cada árbol que se crea, el algoritmo realiza una selección de variables de forma aleatoria. Para estas *k* variables se realiza la clasificación de 2/3 de los datos, y se dejan 1/3 *out-of-bag* que se utilizan para evaluar la bondad del modelo.  
+
+## Predicción de nuevos datos  
+
+Vamos a cargar una imagen satelital que clasificaremos con el modelo que hemos guardado previamente y que se llama `rf_model`.  
+
+En primer lugar cargamos el raster y cambiamos el nombre a las bandas:  
+
+```{r}
+# Cargar datos y cambiar nombres
+multiestacional <- rast('01-datos/multiestacional.tif')
+names(multiestacional) <- names(myTraining)[-31]
+
+# Convertir a data frame para poder utilizar predict
+multi_df <- as.data.frame(as.matrix(multiestacional))
+```
+
+Finalmente se utiliza la función `predict` para predecir los valores de la imagen *multiestacional*.  
+
+```{r predRF}
+#| cache: true
+pred_multiestacional <- predict(rf_model,
+                                new_data = multi_df)
+```
+
+Para poder ver los resultados, podemos crear un *SpatRaster* al que cambiaremos los valores por los predichos, ademas de modificar el nombre
+
+```{r}
+# Crear SpatRast
+pred_map <- multiestacional[[1]]
+
+# Sustituir valores
+values(pred_map) <- factor(pred_multiestacional$.pred_class,
+                           labels = c('Caducifolio','Urbano','Pastizal',
+                                      'Coniferas','Quercineas','Secano',
+                                      'Suelos','Matorral'))
+```
+
+Los resultados finales pueden ver en la siguiente imagen:  
+
+```{r}
+#| fig-cap: 'Clasificación final utilizando Random Forest'
+#| label: fig-predRF
+ggplot() +
+  geom_spatraster(data = pred_map) +
+  scale_fill_manual(values = c("#008000", "#808080", "#FFFF00", "#00FF00", "#4FDB26", "#FFA500", "#FFC0CB", "#FF1493") 
+) +
+  labs(fill = '') +
+  
+  ggthemes::theme_pander()
+```
+
+# Otros modelos  
+
+Se van a comparar una serie de modelos. Para evitar redundancia, se analizará principalmente los resultados y no el uso de código. Los modelos que se analizarán son:  
+
+* **Classification trees**  
+
+* **Artificial Neural Networks**  
+
+* **Support Vector Machines**: para este se utilizará solamente el radial.  
+
+## Crear varios modelos  
+
+En primer lugar, podemos especificar los modelos que crearemos con sus respectivas funciones. Los hiperparámetros que se tunearán son los siguientes:  
+
+* **Decission tree**:  
+
+  - **cost_complexity**: parámetro que controla la complejidad del árbol de forma que se evite el sobreajuste buscando un balance de *bias-variance*.  
+ 
+  - **min_n**: número mínimo de observaciones en cada hoja del árbol.   
+ 
+* **ANN**:  
+
+  - **hidden_units**: número de neuronas en la *hidden layer*.  
+ 
+  - **penalty**: cantidad de regularización para prevenir el sobreajuste.  
+ 
+  - **epochs**: número de épocas de entrenamiento. Una época se completa cuando todos los datos de entrenamiento pasan a través de la red neuronal. Se necesita un número suficiente para alcanzar buenos resultados, pero un número muy grande puede llevar a sobreajuste.  
+ 
+* **SVM radial**:  
+
+  - **cost**: controla el compromiso entre maximizar el margen y minimizar el error de clasificación. Un valor bajo permite mayores errores con un margen amplio. Cuanto mayor sea más complejo será el modelo y más riesgo de sobreajuste tendremos.  
+ 
+  - **rbf_sigma**: determina la amplitud del Kernel utilizado. Cuanto más bajos sean los valores, más amplio y suave será el Kernel.   
+
+A continuación se crean las especificaciones de los modelos que utilizaremos.  
+
+```{r}
+cart_spec <- 
+  decision_tree(cost_complexity = tune(), 
+                min_n = tune(),
+                tree_depth = tune()) |> 
+  set_engine('rpart') |> 
+  set_mode('classification')
+
+nnet_spec <- 
+  mlp(hidden_units = tune(), 
+      penalty = tune(), 
+      epochs = tune()) |> 
+  set_engine("nnet") |> 
+  set_mode("classification")
+
+svm_r_spec <- 
+   svm_rbf(cost = tune(), rbf_sigma = tune()) |> 
+   set_engine("kernlab") |> 
+   set_mode("classification")
+```
+
+Además, como se recomienda aplicar *feature scaling* a ANN y SVM, se crearán dos recetas de preprocesamiento (una para clasificadores paramétricos y otra para no paramétricos). Además se utiliza `step_nzv()` que elimina variables con varianza casi igual a 0.  
+
+```{r}
+# Receta con feature scaling
+norm_rec <- 
+  recipe(class_id ~ ., data = myTraining) |> 
+  step_nzv(all_predictors()) |> 
+  step_normalize(all_predictors())
+
+# Receta sin feature scaling
+np_rec <- 
+  recipe(class_id ~ ., data = myTraining) |> 
+  step_nzv(all_predictors())
+```
+
+## Cruce de modelos  
+
+Para cruzar los modelos con las *recipes* se utiliza la función `workflow_set()`, y luego se pueden unir simplemente uniendo filas.  
+
+```{r}
+normalized <- 
+  workflow_set(
+    preproc = list(normalized = norm_rec),
+    models = list(SVM = svm_r_spec,
+                  neural_network = nnet_spec)
+  )
+
+non_normalized <- 
+  workflow_set(
+    preproc = list(non_normalized = np_rec),
+    models = list(RF = rf_spec,
+                  CART = cart_spec)
+  )
+
+all_workflows <- 
+  bind_rows(normalized, non_normalized) |> 
+  mutate(wflow_id = gsub("(normalized_)|(non_normalized_)", "", wflow_id))
+
+all_workflows
+```
+
+A continuación se va a tunear los hiperparámetros utilizando un simple grid de 10 combinaciones de los hiperparámetros para cada modelo.   
+
+```{r workflowMap}
+#| cache: true
+# Parametros de control
+grid_ctrl <-
+   control_grid(
+      save_pred = TRUE,
+      parallel_over = 'everything',
+      save_workflow = TRUE
+   )
+
+# Correr modelos
+grid_results <-
+   all_workflows |> 
+   workflow_map(
+      'tune_grid',
+      seed = 126,
+      resamples = myFolds,
+      grid = 10,
+      control = grid_ctrl
+   )
+```
+
+En la siguiente tabla podemos ver los resultados, con los modelos ordenados según la métrica ROC AUC.  
+
+<center>
+```{r}
+#| echo: false
+grid_results |> 
+  rank_results() |> 
+  filter(.metric == 'roc_auc') |> 
+  dplyr::select(model, .config, roc_auc = mean, rank) |> 
+  flextable()
+```
+</center>
+
+El mejor modelo ha sido una red neuronal, aunque muy de cerca están todos los modelos Random Forest (ROC_AUC $\sim 0.98$). Los modelos que peor desempeño han tenido han sido los SVM. Podemos tambien por ejemplo, ver el desempeño de los hiperparámetros para *Random Forest* en la [Fig. @fig-rf2].  
+
+```{r}
+#| fig-cap: 'Desempeño de Random Forest para distintos valores de k parámetros y número de árboles'
+#| label: fig-rf2
+#| echo: false
+autoplot(
+  grid_results,
+  id = 'RF',
+  metric = 'roc_auc'
+) +
+  theme_bw() +
+  theme(legend.position = '',
+        text = element_text(size = 12))
+```
+
+<br>  
+
+## Last fit  
+
+Se pedía en el ejercicio hacer una comparación de la cartografía obtenida con cada uno de los algoritmos. Para esto, debemos extraer el mejor modelo de cada uno de los algoritmos. No se ha encontrado una forma de hacerlo automáticamente todo junto, por lo que a partir de ahora se trabajará los modelos individualmente. Podemos ver en que los hiperparámetros de *Random Forest* han cambiado al utilizar este método a 9 variables y 1795 árboles.  
+
+```{r}
+best_cart <- grid_results |> 
+  extract_workflow_set_result("CART") |> 
+  select_best(metric = 'roc_auc')
+
+best_svm <- grid_results |> 
+  extract_workflow_set_result("SVM") |> 
+  select_best(metric = 'roc_auc')
+
+best_ann <- grid_results |> 
+  extract_workflow_set_result("neural_network") |> 
+  select_best(metric = 'roc_auc')
+
+best_rf <- grid_results |> 
+  extract_workflow_set_result("RF") |> 
+  select_best(metric = 'roc_auc')
+```
+
+```{r}
+best_cart
+best_svm
+best_ann
+best_rf
+```
+
+En el siguiente paso se hace el ajuste a los datos de prueba y se comprueba el desempeño de cada modelo en datos que no ha visto el proceso de diseño del mismo.  
+
+```{r}
+#| code-summary: 'Resultados CART'
+cart_test_results <- 
+   grid_results |> 
+   extract_workflow("CART") |> 
+   finalize_workflow(best_cart) |>  
+   last_fit(split = initial)
+
+collect_metrics(cart_test_results)
+```
+
+```{r}
+#| code-summary: 'Resultados SVM'
+svm_test_results <- 
+   grid_results |> 
+   extract_workflow("SVM") |> 
+   finalize_workflow(best_svm) |>  
+   last_fit(split = initial)
+
+collect_metrics(svm_test_results)
+```
+
+```{r}
+#| code-summary: 'Resultados RF'
+rf_test_results <- 
+   grid_results |> 
+   extract_workflow("RF") |> 
+   finalize_workflow(best_rf) |>  
+   last_fit(split = initial)
+
+collect_metrics(rf_test_results)
+```
+
+```{r}
+#| code-summary: 'Resultados ANN'
+ann_test_results <- 
+   grid_results |> 
+   extract_workflow("neural_network") |> 
+   finalize_workflow(best_ann) |>  
+   last_fit(split = initial)
+
+collect_metrics(ann_test_results)
+```
+
+Según accuracy los mejores modelos son: ANN > RF > SVM > CART  
+
+Según ROC AUC los mejores modelos son: ANN > RF > CART > SVM  
+
+Los valores de las métricas de evaluación de la red neural han tenido el mejor desempeño para ambas métricas, aunque es muy similar a *Random Forest* en desempeño.  
+
+## Predicción del área de estudio  
+
+En último lugar se pide predecir los resultados en el área de estudio. Para ello, vamos a extraer los modelos:  
+
+```{r}
+cart_model <- extract_fit_parsnip(cart_test_results)
+svm_model <- extract_fit_parsnip(svm_test_results)
+rf_model <- extract_fit_parsnip(rf_test_results)
+ann_model <- extract_fit_parsnip(ann_test_results)
+```
+
+En siguiente lugar, se aplica el preprocesamiento a los datos que queremos predecir. Para ello se prepara la *recipe* (`prep(recipe)`) y luego se "bate" con datos nuevos (`bake()`). Es decir, *multi_norm* es un objeto al que se ha aplicado la normalización de los datos de entrenamiento.  
+
+```{r}
+multi_norm <- bake(prep(norm_rec), new_data = multi_df)
+multi_np <- bake(prep(np_rec), new_data = multi_df)
+
+head(multi_norm[,1:4])
+```
+
+Ahora que tenemos los datos que queremos predecir procesados, vamos a utilizar los modelos guardados para obtener la cartografía final.  
+
+```{r predictions4models}
+#| cache: true
+# Predicciones
+pred_cart <- predict(cart_model,
+                     new_data = multi_np)
+pred_svm <- predict(svm_model,
+                    new_data = multi_norm)
+pred_rf <- predict(rf_model,
+                   new_data = multi_np)
+pred_ann <- predict(ann_model,
+                    new_data = multi_norm)
+```
+
+
+
+
+```{r}
+# Crear SpatRast para sobreescribir
+map_cart <- multiestacional[[1]]
+map_rf <- multiestacional[[1]]
+map_svm <- multiestacional[[1]]
+map_ann <- multiestacional[[1]]
+
+# Sustituir valores
+values(map_cart) <- factor(pred_cart$.pred_class,
+                           labels = c('Caducifolio','Urbano','Pastizal',
+                                      'Coniferas','Quercineas','Secano',
+                                      'Suelos','Matorral'))
+values(map_svm) <- factor(pred_svm$.pred_class,
+                           labels = c('Caducifolio','Urbano','Pastizal',
+                                      'Coniferas','Quercineas','Secano',
+                                      'Suelos','Matorral'))
+values(map_rf) <- factor(pred_rf$.pred_class,
+                           labels = c('Caducifolio','Urbano','Pastizal',
+                                      'Coniferas','Quercineas','Secano',
+                                      'Suelos','Matorral'))
+values(map_ann) <- factor(pred_ann$.pred_class,
+                           labels = c('Caducifolio','Urbano','Pastizal',
+                                      'Coniferas','Quercineas','Secano',
+                                      'Suelos','Matorral'))
+```
+
+Hecho esto, no queda más que hacer una representación gráfica para comparar. Se ha creado un *tabset* para poder identificar cambios con mayor facilidad. Se puede ver que los patrones generales los captan todos los modelos. Por ejemplo, la zona sur se ve claramente que es arbolado, pero en algunas zonas se identifica mayor caducifolias por parte de algún algoritmo (RF), y otros identifican más coníferas (ANN).  
+
+:::{.panel-tabset}
+
+## CART  
+
+```{r}
+#| echo: false
+ggplot() +
+  geom_spatraster(data = map_cart) +
+  scale_fill_manual(values = c("#008000", "#808080", "#FFFF00", "#00FF00", "#4FDB26", "#FFA500", "#FFC0CB", "#FF1493") 
+) +
+  labs(fill = '', title = 'CART') +
+  
+  ggthemes::theme_pander()
+```
+
+## SVM    
+
+```{r}
+#| echo: false
+ggplot() +
+  geom_spatraster(data = map_svm) +
+  scale_fill_manual(values = c("#008000", "#808080", "#FFFF00", "#00FF00", "#4FDB26", "#FFA500", "#FFC0CB", "#FF1493") 
+) +
+  labs(fill = '', title = 'SVM') +
+  
+  ggthemes::theme_pander()
+```
+
+## Random Forest      
+
+```{r}
+#| echo: false
+ggplot() +
+  geom_spatraster(data = map_rf) +
+  scale_fill_manual(values = c("#008000", "#808080", "#FFFF00", "#00FF00", "#4FDB26", "#FFA500", "#FFC0CB", "#FF1493") 
+) +
+  labs(fill = '', title = 'RF') +
+  
+  ggthemes::theme_pander()
+```
+
+## ANN  
+
+```{r}
+#| echo: false
+ggplot() +
+  geom_spatraster(data = map_ann) +
+  scale_fill_manual(values = c("#008000", "#808080", "#FFFF00", "#00FF00", "#4FDB26", "#FFA500", "#FFC0CB", "#FF1493") 
+) +
+  labs(fill = '', title = 'ANN') +
+  
+  ggthemes::theme_pander()
+```
+
+:::
+
+
+
+
+
+# Información de la sesión  
+
+```{r}
+#| echo: false
+report(sessionInfo())
+```
+
+
+
+
+
+# References
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
